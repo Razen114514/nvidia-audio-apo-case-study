@@ -1,214 +1,101 @@
-# NVIDIA Recording Stutter Caused by a Headset APO
+# NVIDIA Audio APO Case Study and AudioModeTray
 
-## Summary
+This repository contains:
 
-A Windows 11 machine experienced stuttering while recording desktop video
-with NVIDIA's recording feature. The user did not need microphone audio,
-and microphone capture was disabled in both Windows and NVIDIA settings.
+- A technical case study of an NVIDIA recording-stutter issue caused by a
+  third-party C-Media Audio Processing Object (APO).
+- The AudioModeTray utility produced during the investigation.
+- Source code, build scripts, a white icon, and a compiled executable.
 
-The symptom was not caused by microphone permission or by the recording
-software itself. A third-party C-Media Audio Processing Object (APO)
-installed for an MCHOSE G9 USB headset was loaded into the Windows audio
-engine on the playback path. The faulty component crashed
-`audiodg.exe`, causing repeated audio-engine restarts while recording.
+The APO and driver remain installed. The utility bypasses the affected
+endpoint's system effects and switches audio endpoint defaults without
+repeatedly enabling and disabling the whole audio device.
 
-The final fix preserved the APO package and audio driver. Only the
-endpoint's unused system effects were bypassed. A small tray application
-then switched between speaker and headset profiles in under a second.
+## Features
 
-## Environment
-
-- Windows 11, build 26100
-- NVIDIA RTX 5060
-- Realtek onboard audio for desktop speakers
-- MCHOSE G9 USB headset with C-Media audio driver and APO
-- NVIDIA overlay recording
-- No microphone input required for the recording workflow
-
-## Initial Assumptions That Were Wrong
-
-The first hypothesis was that NVIDIA was activating the microphone while
-recording desktop video. This did not match the evidence:
-
-- NVIDIA's microphone setting was already `off`.
-- Instant Replay was disabled.
-- The headset microphone endpoint was later disabled completely.
-- Windows recorded no recent microphone access by NVIDIA.
-- The recording stutter and `audiodg.exe` crashes continued.
-
-Disabling or replacing the microphone was therefore not sufficient.
-
-## Diagnostic Evidence
-
-Windows Application Error events repeatedly reported `AUDIODG.EXE`
-exiting with access violations and heap-corruption exceptions.
-
-One crash directly identified:
-
-```text
-Faulting application: AUDIODG.EXE
-Faulting module:     CmApoIce.dll
-Exception code:      0xc0000005
-```
-
-Other crashes appeared as failures in `ntdll.dll` or `RPCRT64.dll`.
-These are commonly where heap corruption is detected rather than where
-the corruption was originally introduced.
-
-The MCHOSE audio endpoint registry data showed that the C-Media effect
-chain was still attached to the playback endpoint:
-
-```text
-PKEY_FX_*EffectClsid -> C-Media APO classes
-```
-
-The important distinction was:
-
-- Disabling the headset microphone did not remove the playback APO.
-- Keeping the headset playback endpoint enabled allowed the APO to remain
-  reachable by the Windows audio engine.
-- Mixed-device configurations made the failures especially repeatable.
-
-## Root Cause
-
-The failure chain was:
-
-1. The Windows audio engine loaded the C-Media APO for the headset's
-   playback endpoint.
-2. NVIDIA recording created and manipulated desktop-audio streams.
-3. The faulty APO corrupted heap state in `audiodg.exe`.
-4. Windows restarted the audio engine.
-5. Audio-engine teardown and restart caused visible recording stutter.
-
-The microphone was incidental. The playback-side APO was the persistent
-problem.
-
-## Rejected Fixes
-
-Several strategies were tested or investigated:
-
-- Disabling microphone permission: insufficient.
-- Turning off microphone capture in NVIDIA: insufficient.
-- Disabling only the headset microphone endpoint: insufficient.
-- Disabling and re-enabling the entire audio device for every mode:
-  functionally effective but slow, taking roughly 10 to 20 seconds.
-- Deleting the APO or driver package: unnecessary for the final solution.
-
-## Final Fix
-
-### Preserve the APO Package
-
-The C-Media driver and APO files were left installed.
-
-### Disable Endpoint System Effects
-
-The Windows endpoint property
-`PKEY_AudioEndpoint_Disable_SysFx` was set to `1` for the affected
-headset endpoints.
-
-The property is:
-
-```text
-GUID: {1da5d803-d492-4edd-8c23-e0c0ffee7f0e}
-PID:  5
-Type: VT_UI4
-```
-
-Setting the value to `1` disables the system-effect APO chain for that
-endpoint. This is the same setting exposed by Windows audio
-enhancements controls.
-
-The Windows Audio service was restarted after applying the setting so
-the audio engine reloaded its endpoint configuration.
-
-### Keep the Audio Devices Available
-
-The application no longer disables the entire headset for every mode
-switch. Both playback devices remain available, which removes the slow
-device-enumeration path from normal switching.
-
-Only microphone endpoints are made mutually exclusive:
-
-- Speaker mode: Realtek output, headset microphone disabled.
-- Headset mode: MCHOSE G9 input and output, Realtek microphone disabled.
-
-### Fast Native Switching
-
-The tray application now performs switching in-process using:
-
-- Direct endpoint metadata reads from the Windows MMDevices registry.
-- `pnputil` for fast endpoint enable and disable operations.
-- Core Audio `IPolicyConfig` calls for default-device selection.
-- The same policy API to set `Disable_SysFx`.
-
-Measured timings on the affected machine:
-
-```text
-Native profile apply:     approximately 0.08 to 0.16 seconds
-Hotkey-triggered apply:   approximately 0.16 to 0.32 seconds
-```
-
-## Final UX
-
-The tray application provides:
-
-- Speaker mode.
-- G9 headset mode.
+- Speaker mode using the Realtek playback device.
+- MCHOSE G9 headset mode using the G9 playback and capture endpoints.
 - Desktop microphone mode for a future motherboard microphone.
-- Current-mode indicators.
+- Only one microphone endpoint is active at a time.
+- Login auto-start through Windows Task Scheduler.
 - Automatic correction after audio-device changes.
-- Login auto-start.
+- Native in-process switching with no PowerShell startup per hotkey.
+- Global hotkeys:
+  - `Ctrl + Win + Shift + Page Up`: speaker mode
+  - `Ctrl + Win + Shift + Page Down`: G9 headset mode
+- White multi-resolution speaker icon.
+- Fully reversible endpoint configuration.
 
-Global shortcuts:
+## Requirements
 
-```text
-Ctrl + Win + Shift + Page Up    -> Speaker mode
-Ctrl + Win + Shift + Page Down  -> Headset mode
+- Windows 11
+- .NET Framework 4.8
+- Administrator access for installing the tray task
+- Realtek onboard audio and a MCHOSE G9 headset for the default profile
+
+The source can be adapted to other endpoint names by changing the device
+patterns in `src/AudioSwitchEngine.cs`.
+
+## Install
+
+Run PowerShell as Administrator:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install.ps1
 ```
 
-The application uses a simple white speaker icon with a transparent
-background.
+The installer:
 
-## Verification
+1. Builds the executable when `dist\AudioModeTray.exe` is missing.
+2. Copies the executable and supporting scripts to
+   `C:\ProgramData\AudioMode`.
+3. Registers the `AudioModeTray` scheduled task at user logon.
+4. Starts the tray application.
 
-After applying the endpoint effect override:
+If the tray icon is hidden by Windows 11, open the notification-area
+overflow menu and drag the icon onto the taskbar.
 
-- `Disable_SysFx` read back as `1`.
-- The C-Media APO file remained present and unchanged.
-- The headset playback endpoint remained enabled.
-- The headset microphone was disabled in speaker mode.
-- The Realtek playback endpoint remained the default output.
-- No new `AUDIODG.EXE` crash events occurred during the test period.
-- The audio engine kept the same process ID for the remainder of the
-  test.
+## Build
 
-The user also completed a recording test and reported that the previous
-stutter was no longer present.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1
+```
 
-## Lessons
+Build output:
 
-1. A microphone issue is not always a microphone-capture issue.
-2. Check render endpoints as well as capture endpoints when
-   `audiodg.exe` crashes.
-3. An APO can remain reachable even when its microphone endpoint is
-   disabled.
-4. A crash in `ntdll.dll` or an RPC DLL can be a downstream symptom of
-   heap corruption introduced by another loaded module.
-5. Keep the APO package when possible and use the documented endpoint
-   effect override first.
-6. Avoid enabling and disabling an entire audio device for routine
-   profile switching. Cache endpoint identity and use targeted endpoint
-   operations.
-7. Treat driver updates and device re-enumeration as conditions that may
-   reset endpoint settings, and verify them again after such events.
+```text
+dist\AudioModeTray.exe
+dist\AudioModeTray.ico
+dist\AudioModeTray-icon-preview.png
+```
 
-## Reversibility
+The executable is currently unsigned.
 
-The effect override is reversible:
+## Manual diagnostics
 
-- Set `PKEY_AudioEndpoint_Disable_SysFx` back to `0`.
-- Restart the Windows Audio service.
-- The installed APO and driver remain available.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Fast-Switch-AudioMode.ps1 -Mode Status
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Set-G9SysFx.ps1 -State Status
+```
 
-Endpoint state changes can also be reversed with standard Windows PnP
-enable and disable operations.
+`Set-G9SysFx.ps1` can disable or re-enable endpoint system effects:
+
+```powershell
+.\scripts\Set-G9SysFx.ps1 -State Disable
+.\scripts\Set-G9SysFx.ps1 -State Enable
+```
+
+## Case study
+
+The complete investigation is in
+[`docs/case-study.md`](docs/case-study.md).
+
+## Safety
+
+- This project changes Windows audio endpoint defaults and endpoint
+  enable states.
+- It uses an elevated scheduled task because PnP endpoint changes require
+  administrator privileges.
+- It does not delete the headset driver or APO package.
+- Back up relevant audio registry values before adapting the approach to
+  other hardware.
